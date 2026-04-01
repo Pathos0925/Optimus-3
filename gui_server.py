@@ -19,7 +19,8 @@ from minestudio.simulator.callbacks.commands import CommandsCallback
 from PIL import Image
 from pydantic import BaseModel
 
-from minecraftoptimus.model.agent.optimus3 import Optimus3Agent,check_inventory
+from minecraftoptimus.evaluation.optimus2.long_horizon_task import check_inventory
+from minecraftoptimus.model.agent.optimus3 import Optimus3Agent
 
 
 paused = False
@@ -131,6 +132,8 @@ async def check_gpu():
 
 
 
+
+
 async def _send_to_clients(base64_png: str):
     if not connected_clients:
         return
@@ -190,7 +193,7 @@ async def broadcast_obs(base64_png: str):
 
 @app.post("/pause")
 async def pause_agent():
-    
+   
     global paused
     paused = True
     # Clear pending frames so UI shows the newest snapshot.
@@ -293,9 +296,9 @@ async def reset(reset_data: ResetData):
         helper = {"craft": CraftWorker(env), "smelt": SmeltWorker(env), "equip": EquipWorker(env)}
         if not model:
             model = Optimus3Agent(
-                "Optimus3-Policy dir",
-                "optimus3-mllm dir",
-                "optimus3-task-router dir",
+                "policy dir",
+                "optimus3 dir",
+                "task-router dir",
                 device=reset_data.device,
             )
         obs_b64 = ndarray_to_base64(current_info["pov"])
@@ -309,138 +312,6 @@ async def reset(reset_data: ResetData):
 
 
 def _step(env, agent, obs, task, goal, helper):
-    global look_down_once, log_count, iron_ore_count, golden_ore_count, diamond_ore_count, redstone_ore_count
-
-    while paused:
-        time.sleep(0.05)
-    if "craft" in task:
-        helper["craft"].step_hook = lambda info: asyncio.create_task(broadcast_obs(ndarray_to_base64(info["pov"])))
-        result, _ = helper["craft"].crafting(goal["item"], goal["count"])
-        action = env.env.noop_action()
-
-        pickaxe = env.find_best_pickaxe()
-        if pickaxe:
-            helper["equip"].equip_item(pickaxe)
-        obs, reward, terminated, truncated, info = env.step(action)
-
-    elif "smelt" in task:
-        helper["smelt"].step_hook = lambda info: asyncio.create_task(broadcast_obs(ndarray_to_base64(info["pov"])))
-        result, _ = helper["smelt"].smelting(goal["item"], goal["count"])
-        obs, reward, terminated, truncated, info = env.step(env.env.noop_action())
-    else:
-        env._only_once = True
-        action, memory = agent.get_action(obs, task)
-        action = env.agent_action_to_env_action(action)
-        action["drop"] = np.array(0)
-        action["inventory"] = np.array(0)
-        action["use"] = np.array(0)
-        for i in range(9):
-            action[f"hotbar.{i + 1}"] = np.array(0)
-
-        if "dig down" in task:
-            action["jump"] = action["left"] = action["right"] = np.array(0)
-            action["sneak"] = action["sprint"] = np.array(0)
-            if not look_down_once:
-                pickaxe = env.find_best_pickaxe()
-                helper["equip"].equip_item(pickaxe)
-                helper["craft"]._look_down()
-                look_down_once = True
-            action["attack"] = np.array(1)
-        
-        if action["attack"] > 0:
-            action["jump"] = action["left"] = action["right"] = np.array(0)
-            action["sneak"] = action["sprint"] = np.array(0)
-
-        obs, reward, terminated, truncated, info = env.step(action)
-
-    check, count = check_inventory(info["inventory"], goal["item"], goal["count"])
-    if check:
-        if goal["item"] == "logs":
-            log_count = count
-        elif goal["item"] == "iron_ore":
-            iron_ore_count = count
-        elif goal["item"] == "gold_ore":
-            golden_ore_count = count
-        elif goal["item"] == "diamond":
-            diamond_ore_count = count
-        elif goal["item"] == "redstone":
-            redstone_ore_count = count
-        look_down_once = False
-    return obs, info, check
-
-
-@app.get("/get_obs")
-async def get_obs():
-    global current_obs
-    if not env or not current_obs:
-        raise HTTPException(status_code=400, detail="Environment not initialized or no observation.")
-    try:
-        obs_b64 = ndarray_to_base64(current_info["pov"])
-
-        asyncio.create_task(broadcast_obs(obs_b64))
-        
-    except Exception as e:
-        logger.error(f"Error returning observation: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to return observation: {str(e)}")
-
-
-@app.get("/initial_text")
-async def initial_text():
-    initial_text = """Hello! I'm Optimus-3, your Minecraft agent. I can help you with task planning, action execution, and visual perception in Minecraft (including captioning, embodied question answering, and grounding). Let's embark on an exciting journey of exploration in Minecraft!
-     """
-    return {
-        "status": "success",
-        "text": initial_text,
-        "timestamp": datetime.now().isoformat(),
-    }
-
-
-@app.post("/send_text")
-async def send_text(text_data: TextData):
-    """
-    Processes a text command and returns a response.
-    """
-    global env, model, current_obs, sub_tasks, goals, sub_task_index, last_action, current_info
-    if not env or model is None:
-        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
-
-    try:
-       
-        user_text = text_data.text.strip() if text_data.text else ""
-        task_type = text_data.task.strip()
-        logger.info(f"Received text '{user_text}' with task '{task_type}'")
-        if current_info is None or "pov" not in current_info:
-            raise HTTPException(status_code=400, detail="No current observation. Call /reset first.")
-
-        img = Image.fromarray(current_info["pov"])
-        
-        if "help" in user_text:
-            response_text = """
-            Available commands:
-            [Planning] [Captioning] [Embodied QA] [Grounding] [Long-horizon Action]
-            """
-        else:
-            with torch.no_grad():
-                print(f"Task type: {task_type}")
-                if task_type == "planning":
-                    response_text, _sub_plans, _goals = model.plan(user_text)
-                    sub_tasks = _sub_plans
-                    goals = _goals
-                    sub_task_index = 0
-                    model.task = None
-                elif task_type == "captioning" or task_type == "embodied_qa":
-                    response_text = model.answer(user_text, img)
-                elif task_type == "action":
-                    
-                    if sub_tasks and sub_task_index < len(sub_tasks):
-                        if model.task is None:
-                            model.reset(sub_tasks[sub_task_index])
-                        obs, info, check = _step(
-                            env, model, current_obs, sub_tasks[sub_task_index], goals[sub_task_index], helper
-                        )
-                        if check:
-                            sub_task_index += 1
-                            model.tasdef _step(env, agent, obs, task, goal, helper):
     global look_down_once, log_count, iron_ore_count, golden_ore_count, diamond_ore_count, redstone_ore_count
 
     while paused:
@@ -492,7 +363,7 @@ async def send_text(text_data: TextData):
                 helper["craft"]._look_down()
                 look_down_once = True
             action["attack"] = np.array(1)
-        # attack时不乱动
+        
         if action["attack"] > 0:
             action["jump"] = action["left"] = action["right"] = np.array(0)
             action["sneak"] = action["sprint"] = np.array(0)
@@ -598,6 +469,12 @@ async def send_text(text_data: TextData):
                 elif task_type == "captioning" or task_type == "embodied_qa":
                     response_text = model.answer(user_text, img)
                 elif task_type == "action":
+                    # response_text, _sub_plans, _goals = model.plan(user_text)
+                    # sub_tasks = _sub_plans
+                    # goals = _goals
+                    # sub_task_index = 0
+                    # print(sub_tasks)
+                    # print(goals)
                     if sub_tasks and sub_task_index < len(sub_tasks):
                         if model.task is None:
                             model.reset(sub_tasks[sub_task_index])
@@ -695,7 +572,8 @@ async def get_status():
     """
     return {"status": "running"}
 
+
 if __name__ == "__main__":
     import uvicorn
-    #  input the host(ip of server), e.g., 10.xx.xx.xx
-    uvicorn.run("gui_server:app", host="", port=9500)
+
+    uvicorn.run("gui_server:app", host="ip", port=9500)
