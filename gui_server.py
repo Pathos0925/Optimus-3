@@ -19,8 +19,8 @@ from minestudio.simulator.callbacks.commands import CommandsCallback
 from PIL import Image
 from pydantic import BaseModel
 
-from minecraftoptimus.evaluation.optimus2.long_horizon_task import check_inventory
-from minecraftoptimus.model.agent.optimus3 import Optimus3Agent
+
+from minecraftoptimus.model.agent.optimus3 import Optimus3Agent,check_inventory
 
 
 paused = False
