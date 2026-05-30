@@ -61,7 +61,7 @@ class Optimus3Agent(BaseAgent, ModelHubMixin):
         self,
         policy_ckpt_path: str,
         mllm_model_path: str,
-        task_router_ckpt_path: str = "path_to_task_router/optimus3-task-router",
+        task_router_ckpt_path: str = "/ephemeral/Optimus-3/checkpoint/Optimus-3-Task-Router",
         device="cuda",
     ):
         super().__init__()
@@ -71,8 +71,13 @@ class Optimus3Agent(BaseAgent, ModelHubMixin):
         self.cache_mllm_embed = None
         self.cache_task = None
 
+        import os as _os
+        _attn_impl = _os.environ.get("OPTIMUS_ATTN", "flash_attention_2")
+        _dtype = {"float32": torch.float32, "fp32": torch.float32, "bfloat16": torch.bfloat16,
+                  "bf16": torch.bfloat16, "float16": torch.float16, "fp16": torch.float16}[
+            _os.environ.get("OPTIMUS_DTYPE", "bfloat16")]
         self.model = Optimus3ForConditionalGeneration.from_pretrained(
-            mllm_model_path, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16
+            mllm_model_path, attn_implementation=_attn_impl, torch_dtype=_dtype
         )
         self.processor = AutoProcessor.from_pretrained(mllm_model_path)
         self.task_router = TaskRouterModel.from_pretrained(task_router_ckpt_path)
@@ -182,13 +187,19 @@ class Optimus3Agent(BaseAgent, ModelHubMixin):
         return output_texts
 
     @torch.inference_mode()
-    def plan(self, task: str) -> tuple[str, list[str], list[dict]]:
+    def plan(self, task: str, image: np.ndarray | str | None = None) -> tuple[str, list[str], list[dict]]:
+        user_content = [{"type": "text", "text": "How to " + task + " from scratch?"}]
+        # Planning is conditioned on the current view (hotbar/inventory). Without
+        # the image the model hallucinates inventory and degenerates into garbage,
+        # so always pass the current observation in (see base.plan signature).
+        if image is not None:
+            user_content.append({"type": "image", "image": image})
         messages = [
             {
                 "role": "system",
                 "content": self.system_prompt,
             },
-            {"role": "user", "content": [{"type": "text", "text": "How to " + task + " from scratch?"}]},
+            {"role": "user", "content": user_content},
         ]
         original_text = self._generate(messages, task_type="plan", max_new_tokens=512)[0]
         output_texts = extract_answer(original_text)

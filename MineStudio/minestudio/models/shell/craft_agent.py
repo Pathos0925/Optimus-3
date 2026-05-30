@@ -466,7 +466,7 @@ class Worker(object):
             # is item/tag
             is_tag = False
             cur_path = os.path.abspath(os.path.dirname(__file__))
-            root_path = "/data7/Users/xyq/developer/MinecraftOptimus/MineStudio/minestudio"
+            root_path = os.path.dirname(os.path.dirname(cur_path))
             relative_path = os.path.join("assets/tag_items.json")
             tag_json_path = os.path.join(root_path, relative_path)
             with open(tag_json_path) as file:
@@ -541,7 +541,7 @@ class Worker(object):
             if self.info['isGuiOpen']:
                 self._call_func('inventory')
             cur_path = os.path.abspath(os.path.dirname(__file__))
-            root_path = "/data7/Users/xyq/developer/MinecraftOptimus/MineStudio/minestudio"
+            root_path = os.path.dirname(os.path.dirname(cur_path))
             relative_path = os.path.join("assets/recipes", target + '.json').replace(" ","_")
             recipe_json_path = os.path.join(root_path, relative_path)
             try:
@@ -640,7 +640,7 @@ class Worker(object):
             elif item_type == "tag":
                 # tag info
                 cur_path = os.path.abspath(os.path.dirname(__file__))
-                root_path = "/data7/Users/xyq/developer/MinecraftOptimus/MineStudio/minestudio"
+                root_path = os.path.dirname(os.path.dirname(cur_path))
                 relative_path = os.path.join("assets/tag_items.json")
                 tag_json_path = os.path.join(root_path, relative_path)
                 with open(tag_json_path) as file:

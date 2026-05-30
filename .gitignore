@@ -1,3 +1,7 @@
 LLaMA-Factory/
 __pycache__/
 logs/
+checkpoint/
+*.pyc
+# minerl runtime scratch db
+MineStudio/minestudio/simulator/minerl/tmp/database/cache.db*

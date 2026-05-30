@@ -145,6 +145,44 @@ If you encounter an error about the 'collection', change collections to collecti
 If you encounter an error about the 'model_type', you can change the model_type (line 22) into "qwen2_5_vl" in /checkpoint/Optimus3/config.json
 ```
 
+### 🌐 Web client (browser — recommended for SSH / VS Code)
+
+This fork adds a **single-port Flask web client** (`web_client.py`) as an alternative to the PyQt desktop client. The browser talks only to the Flask app, which reverse-proxies both the REST API and the live-frame WebSocket to the server — so you only need to forward **one** port.
+
+```shell
+# 1. start the server (sets Java 8 on PATH, runs under xvfb, GPU rendering on by default)
+./run_server.sh
+
+# 2. start the web client (defaults to port 7860; SERVER_HOST/SERVER_PORT/CLIENT_PORT are overridable)
+./run_client.sh
+```
+
+Then forward the client port (default **7860**) — e.g. in the VS Code **Ports** panel — and open `http://localhost:7860`.
+
+Features: live POV view, the task modes (Planning / Captioning / Embodied QA / Grounding), single-step **Action** + **Auto-run**, Pause / Resume / Reset, a frames-per-second counter, a **💭 Show thinking** toggle (shows the model's `<think>` reasoning), and a **render-resolution selector** (640×360 → 1920×1080; higher is sharper but lower fps).
+
+> **Tip — workflow:** select **Planning**, enter a goal (e.g. `craft a diamond sword`), **Send**, then click **Auto-run** to execute the plan. Planning is conditioned on the current view, so plan from a clear surface spot.
+
+### ⚡ GPU rendering (optional, big speedup)
+
+By default the Minecraft client renders on the **CPU** (software GL), which caps the agent at ~20 fps. To render on the GPU instead (≈1.6× faster), install [VirtualGL](https://github.com/VirtualGL/virtualgl/releases) and set `MINESTUDIO_GPU_RENDER=1` (the default in `run_server.sh`):
+
+```shell
+# install VirtualGL (deb from the GitHub releases page), then ensure the GPU's DRI nodes are accessible
+sudo usermod -aG video,render $USER          # (re-login to take effect)
+# or, per session: sudo chmod a+rw /dev/dri/renderD128 /dev/dri/card*
+```
+`launchClient.sh` will then launch Minecraft under `vglrun` on the GPU. Set `MINESTUDIO_GPU_RENDER=0` to fall back to CPU rendering.
+
+### 🛠️ Environment notes (this fork)
+
+Pin these versions — newer releases break the model/loader:
+- `transformers==4.51.3` (matches the checkpoint; 4.53+ removed the attention classes the model imports)
+- `trl==0.19.1` and a **mid-2025 LLaMA-Factory** (commit `0b773234`) so `_register_composite_model` matches
+- `fastapi` + `uvicorn` (not in `requirements.txt`); PyAV (`av==11.0.0`) needs `pkg-config` + ffmpeg `-dev` libs; `pyrender` needs `libglu1-mesa`
+
+Other fixes included here: planning now passes the current view image to the model (fixes garbled plans) and trims its degenerate tail; the streamed view uses JPEG; per-step caching in the action policy; and the hardcoded asset path in `MineStudio/.../shell/craft_agent.py` is resolved from the module location.
+
 ## :smile_cat: Evaluation on MineSys2 Benchmark
 Download the Optimus-3-v2 version on [Huggingface](https://huggingface.co/MinecraftOptimus/Optimus-3-v2).
 ```shell

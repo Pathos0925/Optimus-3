@@ -54,17 +54,21 @@ class ObservationData(BaseModel):
 
 class ResetData(BaseModel):
     device: str
+    width: int | None = None   # optional render resolution; recreates the env at this size
+    height: int | None = None
 
 
 class TextData(BaseModel):
     text: str | None
     task: str
+    steps: int = 1  # action: how many env steps to run per request (batched to amortize round-trip latency)
 
 
 # Global variables to store environment and model state
 env = None
 helper = None
 model = None
+render_size = (1280, 720)  # display resolution of the streamed pov; changeable via /reset
 current_obs = None
 current_info = None
 last_action = None
@@ -83,13 +87,18 @@ redstone_ore_count = 0
 
 def ndarray_to_base64(arr: np.ndarray) -> str:
     """
-    Converts a numpy ndarray (HWC, uint8) to a base64-encoded PNG string.
+    Converts a numpy ndarray (HWC, uint8) to a base64-encoded JPEG string.
+
+    JPEG is ~20x faster to encode than PNG (~1ms vs ~26ms for a 640x360 frame)
+    and ~4x smaller on the wire. Since frames are encoded on every step of the
+    action loop, this is a major throughput win for the live stream. The web
+    client decodes it via a data:image/jpeg URI.
     """
     if arr.dtype != np.uint8:
         arr = arr.astype(np.uint8)
     img = Image.fromarray(arr)
     buffered = BytesIO()
-    img.save(buffered, format="PNG")
+    img.save(buffered, format="JPEG", quality=85)
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
@@ -263,9 +272,14 @@ async def reset(reset_data: ResetData):
     """
     Initializes or resets the MinecRL environment and loads the model.
     """
-    global env, model, current_obs, session_start_time, session_id, helper, current_info
+    global env, model, current_obs, session_start_time, session_id, helper, current_info, render_size
 
     try:
+        # Optional render-resolution change (recreates the env at the new size).
+        if reset_data.width and reset_data.height:
+            render_size = (int(reset_data.width), int(reset_data.height))
+            logger.info(f"Render resolution set to {render_size}")
+
         # Close existing environment if one exists
         if env:
             env.close()
@@ -273,6 +287,10 @@ async def reset(reset_data: ResetData):
         logger.info("Initializing environment")
         env = MinecraftSim(
             obs_size=(128, 128),
+            # Display resolution of the streamed view (selectable from the web UI;
+            # see the `render_size` global). The agent's own input is still
+            # obs_size (128x128) — this only affects the pov shown to the user.
+            render_size=render_size,
             preferred_spawn_biome="forest",
             callbacks=[
                 CommandsCallback(
@@ -296,9 +314,9 @@ async def reset(reset_data: ResetData):
         helper = {"craft": CraftWorker(env), "smelt": SmeltWorker(env), "equip": EquipWorker(env)}
         if not model:
             model = Optimus3Agent(
-                "policy dir",
-                "optimus3 dir",
-                "task-router dir",
+                "/ephemeral/Optimus-3/checkpoint/Optimus-3-ActionHead",
+                "/ephemeral/Optimus-3/checkpoint/Optimus-3",
+                "/ephemeral/Optimus-3/checkpoint/Optimus-3-Task-Router",
                 device=reset_data.device,
             )
         obs_b64 = ndarray_to_base64(current_info["pov"])
@@ -450,6 +468,7 @@ async def send_text(text_data: TextData):
 
         img = Image.fromarray(current_info["pov"])
         # obs = obs.to(next(model).device)
+        raw_output = ""  # full model output (with <think>…</think>), for the "show thinking" option
         if "help" in user_text:
             response_text = """
             Available commands:
@@ -459,7 +478,25 @@ async def send_text(text_data: TextData):
             with torch.no_grad():
                 print(f"Task type: {task_type}")
                 if task_type == "planning":
-                    response_text, _sub_plans, _goals = model.plan(user_text)
+                    response_text, _sub_plans, _goals = model.plan(user_text, img)
+                    raw_output = response_text
+                    # The model frequently degenerates after the real plan (step
+                    # numbers reset/repeat, e.g. ...19, 11, 11, ...). Keep only the
+                    # leading run of strictly-increasing step numbers so both the
+                    # executed sub-tasks and the displayed text are clean.
+                    cut = len(_goals)
+                    last = 0
+                    for i, g in enumerate(_goals):
+                        if g.get("step", 0) <= last:
+                            cut = i
+                            break
+                        last = g["step"]
+                    _sub_plans = _sub_plans[:cut]
+                    _goals = _goals[:cut]
+                    if _sub_plans:
+                        response_text = "\n".join(
+                            f"step {g['step']}: {st}" for st, g in zip(_sub_plans, _goals)
+                        )
                     sub_tasks = _sub_plans
                     goals = _goals
                     sub_task_index = 0
@@ -468,6 +505,7 @@ async def send_text(text_data: TextData):
                     # print(goals)
                 elif task_type == "captioning" or task_type == "embodied_qa":
                     response_text = model.answer(user_text, img)
+                    raw_output = response_text
                 elif task_type == "action":
                     # response_text, _sub_plans, _goals = model.plan(user_text)
                     # sub_tasks = _sub_plans
@@ -476,24 +514,35 @@ async def send_text(text_data: TextData):
                     # print(sub_tasks)
                     # print(goals)
                     if sub_tasks and sub_task_index < len(sub_tasks):
-                        if model.task is None:
-                            model.reset(sub_tasks[sub_task_index])
                         loop = asyncio.get_running_loop()
-                        obs, info, check = await loop.run_in_executor(
-                            None,
-                            _step,
-                            env,
-                            model,
-                            current_obs,
-                            sub_tasks[sub_task_index],
-                            goals[sub_task_index],
-                            helper,
-                        )
-                        if check:
-                            sub_task_index += 1
-                            model.task = None
-                        current_obs = obs
-                        current_info = info
+                        # Run a batch of steps per request. Each step pushes a
+                        # frame over the websocket, so one client round-trip (and
+                        # over SSH, one tunnel latency) drives many streamed
+                        # frames instead of one. Stops early on pause or plan end.
+                        n_steps = max(1, min(text_data.steps, 64))
+                        for _ in range(n_steps):
+                            if paused or sub_task_index >= len(sub_tasks):
+                                break
+                            if model.task is None:
+                                model.reset(sub_tasks[sub_task_index])
+                            obs, info, check = await loop.run_in_executor(
+                                None,
+                                _step,
+                                env,
+                                model,
+                                current_obs,
+                                sub_tasks[sub_task_index],
+                                goals[sub_task_index],
+                                helper,
+                            )
+                            current_obs = obs
+                            current_info = info
+                            # Stream this frame immediately (don't wait for the response).
+                            if info and "pov" in info:
+                                enqueue_obs(ndarray_to_base64(info["pov"]))
+                            if check:
+                                sub_task_index += 1
+                                model.task = None
 
                         if sub_task_index < len(sub_tasks):
                             response_text = sub_tasks[sub_task_index]
@@ -503,11 +552,20 @@ async def send_text(text_data: TextData):
                         response_text = "success"
                 elif task_type == "grounding":
                     response_text = model.grounding(user_text, img)
+                    raw_output = response_text
                 else:
                     response_text = "Unknown task type. Please try again."
                 print(response_text)
 
         response_text = response_text.strip().lower()
+
+        # Extract the model's reasoning (everything before </think>, minus an
+        # optional opening <think>) so the client can optionally display it.
+        thinking = ""
+        if "</think>" in raw_output:
+            head = raw_output.split("</think>", 1)[0]
+            thinking = head.split("<think>", 1)[-1].strip()
+
         if current_info and "pov" in current_info:
             print("image")
             obs_b64 = ndarray_to_base64(current_info["pov"])
@@ -517,6 +575,7 @@ async def send_text(text_data: TextData):
         return {
             "status": "success",
             "response": response_text,
+            "thinking": thinking,
             "session_id": session_id,
             "timestamp": datetime.now().isoformat(),
         }
@@ -576,4 +635,4 @@ async def get_status():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("gui_server:app", host="ip", port=9500)
+    uvicorn.run("gui_server:app", host="0.0.0.0", port=9500)

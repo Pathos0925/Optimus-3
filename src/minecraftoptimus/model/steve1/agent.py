@@ -249,8 +249,19 @@ class Optimus3ActionAgent(ModelHubMixin):
         embed = self.mllm_embed_linear(embed)  # [bs,1,512]
         minerl_obs = {"pov": obs}
 
-        _prompt_embed = get_prior_embed(task, self.mineclip, self.prior, self.device)
-        embed = embed.reshape(*_prompt_embed.shape)
+        # The only thing we need from get_prior_embed(task, ...) here is the target
+        # shape to reshape `embed` into. That shape is constant for a given task (and
+        # in fact architectural), but get_prior_embed runs MineCLIP + the prior VAE
+        # with two GPU->CPU syncs on *every* step. Cache the shape per task so the
+        # per-step action loop doesn't repeat that work. (perf: ~tens of ms/step)
+        cache = getattr(self, "_prior_shape_cache", None)
+        if cache is None:
+            cache = self._prior_shape_cache = {}
+        prior_shape = cache.get(task)
+        if prior_shape is None:
+            _prompt_embed = get_prior_embed(task, self.mineclip, self.prior, self.device)
+            prior_shape = cache[task] = _prompt_embed.shape
+        embed = embed.reshape(*prior_shape)
         embed = self.prior(embed, deterministic=False)
 
         # calculate the cosine similarity between the prompt and the prior
